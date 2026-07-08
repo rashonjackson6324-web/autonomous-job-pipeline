@@ -1,0 +1,25 @@
+{
+  "_comment": "Standard answers the agent reuses across all applications. Replace PLACEHOLDER values. The real profile.json lives in the private ops repo.",
+
+  "personal": {
+    "first_name": "PLACEHOLDER_FIRST",
+    "last_name": "PLACEHOLDER_LAST",
+    "email": "PLACEHOLDER_EMAIL",
+    "phone": "PLACEHOLDER_PHONE",
+    "city": "PLACEHOLDER_CITY",
+    "state": "PLACEHOLDER_STATE",
+    "country": "United States",
+    "linkedin_url": "PLACEHOLDER_LINKEDIN"
+  },
+
+  "work_authorization": {
+    "authorized_to_work_us": "Yes",
+    "requires_sponsorship_now": "No",
+    "will_require_sponsorship_future": "No"
+  },
+
+  "files": {
+    "resume_url": "PLACEHOLDER_PUBLIC_RESUME_PDF_URL",
+    "resume_file_name": "Resume.pdf"
+  }
+}
