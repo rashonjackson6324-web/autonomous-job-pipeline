@@ -1,0 +1,138 @@
+name: Log Application Result
+
+# Appends each Skyvern application result to application_log.csv.
+# Triggered by a repository_dispatch event fired from the Skyvern workflow's
+# log_result_to_github http_request block.
+
+on:
+  # Automatic: fired by the Skyvern http_request block after each job
+  repository_dispatch:
+    types: [application_result]
+
+  # Manual: run it yourself from the Actions tab to append a test row or backfill
+  workflow_dispatch:
+    inputs:
+      job_title:
+        description: "Job title"
+        required: true
+        default: "Manual test entry"
+      company:
+        description: "Company"
+        required: true
+        default: "Test Co"
+      location:
+        description: "Location"
+        required: false
+        default: "Remote"
+      apply_url:
+        description: "Apply URL"
+        required: false
+        default: ""
+      status:
+        description: "Status"
+        required: true
+        type: choice
+        default: "applied"
+        options:
+          - applied
+          - skipped
+          - requires_account
+          - expired
+          - failed
+      reason:
+        description: "Reason (optional)"
+        required: false
+        default: "manual workflow_dispatch test"
+      confirmation:
+        description: "Confirmation URL/message (optional)"
+        required: false
+        default: ""
+      cover_letter_attached:
+        description: "Cover letter attached?"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  # Serialize all log appends so we never race on the CSV SHA.
+  group: application-log-append
+  cancel-in-progress: false
+
+jobs:
+  append:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Use GH_PAT if available so commits from this workflow can trigger
+          # downstream workflows. Falls back to GITHUB_TOKEN (the built-in) if
+          # GH_PAT isn't set — workflow still works, just won't fan out.
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Append row to application_log.csv
+        env:
+          # Fall back between dispatch sources so the same step handles both.
+          JOB_TITLE:  ${{ github.event.client_payload.job_title             || github.event.inputs.job_title }}
+          COMPANY:    ${{ github.event.client_payload.company               || github.event.inputs.company }}
+          LOCATION:   ${{ github.event.client_payload.location              || github.event.inputs.location }}
+          APPLY_URL:  ${{ github.event.client_payload.apply_url              || github.event.inputs.apply_url }}
+          STATUS:     ${{ github.event.client_payload.status                 || github.event.inputs.status }}
+          REASON:     ${{ github.event.client_payload.reason                 || github.event.inputs.reason }}
+          CONF:       ${{ github.event.client_payload.confirmation           || github.event.inputs.confirmation }}
+          CL_ATT:     ${{ github.event.client_payload.cover_letter_attached  || github.event.inputs.cover_letter_attached }}
+          TS:         ${{ github.event.client_payload.timestamp              || '' }}
+        run: |
+          python3 - <<'PY'
+          import csv, os, pathlib
+          path = pathlib.Path("application_log.csv")
+          header = ["timestamp","job_title","company","location","status",
+                    "reason","confirmation","cover_letter_attached","apply_url"]
+          # If Skyvern didn't send a timestamp (or this is a manual dispatch), stamp now in UTC.
+          ts = os.environ.get("TS","") or __import__("datetime").datetime.utcnow().isoformat(timespec="seconds") + "Z"
+          row = [
+              ts,
+              os.environ.get("JOB_TITLE",""),
+              os.environ.get("COMPANY",""),
+              os.environ.get("LOCATION",""),
+              os.environ.get("STATUS",""),
+              os.environ.get("REASON",""),
+              os.environ.get("CONF",""),
+              os.environ.get("CL_ATT",""),
+              os.environ.get("APPLY_URL",""),
+          ]
+          new_file = not path.exists() or path.stat().st_size == 0
+          with path.open("a", newline="", encoding="utf-8") as f:
+              w = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+              if new_file:
+                  w.writerow(header)
+              w.writerow(row)
+          print("Appended row:", row)
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name  "application-logger[bot]"
+          git config user.email "application-logger@users.noreply.github.com"
+          git add application_log.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          STATUS="${{ github.event.client_payload.status   || github.event.inputs.status }}"
+          COMPANY="${{ github.event.client_payload.company || github.event.inputs.company }}"
+          TITLE="${{ github.event.client_payload.job_title || github.event.inputs.job_title }}"
+          git commit -m "log: ${STATUS} — ${COMPANY} — ${TITLE}"
+          # Retry push up to 3 times in case another run pushed in between.
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && exit 0
+            echo "push attempt $i failed; retrying"
+            sleep 2
+          done
+          exit 1
