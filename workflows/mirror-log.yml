@@ -1,0 +1,37 @@
+name: Mirror Application Log
+
+# Copies application_log.csv to the public rashon-public-assets repo so the
+# Skyvern filter_already_applied block can read it (this repo is private).
+
+on:
+  push:
+    branches: [main]
+    paths: [application_log.csv]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Push log to public assets repo
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          GH_PAT="$(printf %s "$GH_PAT" | tr -d '[:space:]')"
+          git clone --depth 1 "https://${GH_PAT}@github.com/rashonjackson6324-web/rashon-public-assets.git" pub
+          cp application_log.csv pub/application_log.csv
+          cd pub
+          git config user.name "log-mirror[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add application_log.csv
+          git diff --cached --quiet && { echo "No changes to mirror"; exit 0; }
+          git commit -m "Mirror application_log.csv from job-application-tracker"
+          git push
