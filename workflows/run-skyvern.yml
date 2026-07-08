@@ -1,0 +1,162 @@
+name: Run Skyvern Job Application Workflow
+
+# Triggers a Skyvern workflow run on a schedule.
+# Skyvern handles the actual browser automation; its http_request block
+# inside the workflow fires application_result dispatches back to this repo,
+# and the existing Log Application Result workflow appends rows to
+# application_log.csv. No CSV writes happen in this file.
+
+on:
+  schedule:
+    # 8:00 AM Eastern = 12:00 UTC during EDT (Mar–Nov), 13:00 UTC during EST (Nov–Mar).
+    # Running at 12:00 UTC year-round means 8 AM EDT / 7 AM EST. Acceptable drift.
+    - cron: "0 12 * * *"
+
+  # Allow manual kickoff from the Actions tab for testing / ad-hoc runs.
+  workflow_dispatch:
+    inputs:
+      wait_for_completion:
+        description: "Wait for the Skyvern run to finish before marking the job done?"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Don't let a scheduled run start while a manual one is in flight.
+  group: run-skyvern
+  cancel-in-progress: false
+
+jobs:
+  trigger-skyvern:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        # Needed so we can read profile.json directly (repo is private, raw URL 404s).
+        uses: actions/checkout@v4
+
+      - name: Fail fast if secrets are missing
+        env:
+          SKYVERN_API_KEY: ${{ secrets.SKYVERN_API_KEY }}
+          SKYVERN_WORKFLOW_ID: ${{ secrets.SKYVERN_WORKFLOW_ID }}
+        run: |
+          missing=""
+          [ -z "$SKYVERN_API_KEY" ]     && missing="$missing SKYVERN_API_KEY"
+          [ -z "$SKYVERN_WORKFLOW_ID" ] && missing="$missing SKYVERN_WORKFLOW_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required repo secrets:$missing"
+            echo "Add them at: https://github.com/${{ github.repository }}/settings/secrets/actions"
+            exit 1
+          fi
+
+      - name: Build deduped jobs CSV and publish
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          GH_PAT="$(printf %s "$GH_PAT" | tr -d '[:space:]')"
+          curl -fsSL "https://raw.githubusercontent.com/rashonjackson6324-web/rashon-public-assets/main/jobs_current.csv" -o jobs_current.csv
+          python3 scripts/filter_jobs.py
+          git clone --depth 1 "https://${GH_PAT}@github.com/rashonjackson6324-web/rashon-public-assets.git" pub
+          cp jobs_filtered.csv pub/jobs_filtered.csv
+          cd pub
+          git config user.name "jobs-filter[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add jobs_filtered.csv
+          git diff --cached --quiet || { git commit -m "Publish deduped jobs_filtered.csv"; git push; }
+          cd ..
+
+      - name: Trigger Skyvern workflow run
+        env:
+          SKYVERN_API_KEY:     ${{ secrets.SKYVERN_API_KEY }}
+          SKYVERN_WORKFLOW_ID: ${{ secrets.SKYVERN_WORKFLOW_ID }}
+          # jobs_csv is served from the PUBLIC assets repo (private repo raw URLs 404).
+          JOBS_CSV_URL:   "https://raw.githubusercontent.com/rashonjackson6324-web/rashon-public-assets/main/jobs_filtered.csv"
+        run: |
+          set -euo pipefail
+
+          # Read profile.json from the checked-out repo (not via raw URL) so it
+          # stays private. Any push to main updates what this step picks up on
+          # the next run.
+          if [ ! -f profile.json ]; then
+            echo "::error::profile.json not found at repo root"
+            exit 1
+          fi
+          profile_json=$(cat profile.json)
+
+          # Build the Skyvern run request body.
+          # github_pat is NOT sent here — it's a Skyvern-stored credential referenced
+          # by credential_id inside the workflow JSON itself.
+          run_title="Scheduled run · $(date -u +'%Y-%m-%d %H:%M UTC')"
+          body=$(jq -n \
+            --arg wf      "$SKYVERN_WORKFLOW_ID" \
+            --arg title   "$run_title" \
+            --arg jobs    "$JOBS_CSV_URL" \
+            --argjson profile "$profile_json" \
+            '{
+              workflow_id: $wf,
+              title: $title,
+              parameters: {
+                jobs_csv: $jobs,
+                profile: $profile
+              }
+            }')
+
+          echo "Triggering Skyvern run: $run_title"
+          echo "$body" > /tmp/skyvern_body.json
+          # Use Python stdlib instead of curl. We hit repeated 422s where Skyvern
+          # reported the body arrived with HTTP headers embedded inside it — likely
+          # an interaction between curl -d/--data-binary and a proxy in front of
+          # api.skyvern.com. urllib sidesteps that.
+          python3 scripts/call_skyvern.py > /tmp/skyvern_result.json
+          http_code=$(jq -r '.code' /tmp/skyvern_result.json)
+          response=$(jq -r '.text' /tmp/skyvern_result.json)
+          echo "$response" > /tmp/skyvern_resp.json
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::Skyvern API returned HTTP $http_code"
+            echo "Response body:"
+            echo "$response"
+            exit 1
+          fi
+
+          run_id=$(echo "$response" | jq -r '.run_id')
+          status=$(echo "$response" | jq -r '.status')
+          app_url=$(echo "$response" | jq -r '.app_url // empty')
+
+          echo "Skyvern run created: $run_id (status: $status)"
+          if [ -n "$app_url" ]; then
+            echo "Live view: $app_url"
+          fi
+
+          # Surface the run details in the GitHub Actions job summary.
+          {
+            echo "## Skyvern Run Triggered"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Run ID | \`$run_id\` |"
+            echo "| Status | $status |"
+            echo "| Title | $run_title |"
+            [ -n "$app_url" ] && echo "| Live view | [$app_url]($app_url) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Optional: poll until completion if manual run requested it.
+          if [ "${{ github.event.inputs.wait_for_completion }}" = "true" ]; then
+            echo "Polling for completion..."
+            for i in $(seq 1 240); do  # 240 * 15s = 60 min max wait
+              sleep 15
+              current=$(curl --fail -sS "https://api.skyvern.com/v1/runs/$run_id" \
+                -H "x-api-key: $SKYVERN_API_KEY" | jq -r '.status')
+              echo "  [$i] status: $current"
+              case "$current" in
+                completed|failed|terminated|timed_out|canceled)
+                  echo "Final status: $current"
+                  [ "$current" = "completed" ] && exit 0 || exit 1
+                  ;;
+              esac
+            done
+            echo "::warning::Timed out waiting for run to finish (Skyvern run is still going)"
+          fi
